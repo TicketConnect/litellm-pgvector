@@ -23,7 +23,9 @@ from models import (
     RatingCreateRequest,
     RatingResponse,
     UserPreferenceCreateRequest,
-    UserPreferenceResponse
+    UserPreferenceResponse,
+    SimilarEventsResponse,
+    EventScoreRequest
 )
 from config import settings
 from embedding_service import embedding_service
@@ -380,12 +382,12 @@ async def search_vector_store(
             has_more=False,  # TODO: Implement pagination
             next_page=None
         )
-        except HTTPException:
-            raise
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
 @app.post("/v1/vector_stores/{vector_store_id}/embeddings/{embedding_id}/rate", response_model=RatingResponse)
@@ -805,6 +807,247 @@ async def create_embeddings_batch(
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": int(time.time())}
+
+
+@app.post("/v1/events/score", response_model=VectorStoreSearchResponse)
+async def score_event(
+    request: EventScoreRequest,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Score a newly added event and return similar events based on tags.
+    Uses organizer-provided tags to find similar events.
+    Falls back to showing available events if there's too little data.
+    """
+    try:
+        # Generate embedding for the event using tags and metadata
+        query_text = " ".join(request.tags or [])
+        if request.metadata:
+            # Add metadata fields to the query text
+            for key, value in request.metadata.items():
+                query_text += f" {value}"
+        
+        if not query_text.strip():
+            query_text = request.event_id
+        
+        # Generate embedding for the query
+        query_embedding = await generate_query_embedding(query_text)
+        query_vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
+        
+        # Build the raw SQL query for vector similarity search
+        limit = 20
+        fields = settings.db_fields
+        table_name = settings.table_names["embeddings"]
+        
+        # Base query with vector similarity using cosine distance
+        param_count = 1
+        query_params = [query_vector_str]
+        
+        base_query = f"""
+        SELECT 
+            {fields.id_field},
+            {fields.content_field},
+            {fields.metadata_field},
+            ({fields.embedding_field} <=> ${param_count}::vector) as distance
+        FROM {table_name}
+        """
+        param_count += 1
+        
+        # Add tag-based filtering if tags are provided
+        filter_conditions = []
+        if request.tags:
+            # Search for embeddings with matching tags in metadata
+            tag_conditions = []
+            for tag in request.tags:
+                tag_conditions.append(f"{fields.metadata_field}->>'tag' = ${param_count}")
+                query_params.append(tag)
+                param_count += 1
+            
+            if tag_conditions:
+                filter_conditions.append("(" + " OR ".join(tag_conditions) + ")")
+        
+        # Exclude the current event from results
+        filter_conditions.append(f"{fields.id_field} != ${param_count}")
+        query_params.append(request.event_id)
+        param_count += 1
+        
+        if filter_conditions:
+            base_query += " WHERE " + " AND ".join(filter_conditions)
+        
+        # Add ordering and limit
+        final_query = base_query + f" ORDER BY distance ASC LIMIT {limit}"
+        
+        # Execute the query
+        results = await db.query_raw(final_query, *query_params)
+        
+        # If too few results, fall back to showing all available events
+        if len(results) < 3:
+            fallback_query = f"""
+            SELECT 
+                {fields.id_field},
+                {fields.content_field},
+                {fields.metadata_field},
+                ({fields.embedding_field} <=> ${1}::vector) as distance
+            FROM {table_name}
+            WHERE {fields.id_field} != ${2}
+            ORDER BY distance ASC LIMIT {limit}
+            """
+            results = await db.query_raw(fallback_query, query_vector_str, request.event_id)
+        
+        # Convert results to SearchResult objects
+        search_results = []
+        for row in results:
+            # Convert distance to similarity score (1 - normalized_distance)
+            similarity_score = max(0, 1 - (row['distance'] / 2))
+            
+            # Extract filename from metadata or use a default
+            metadata = row[fields.metadata_field] or {}
+            filename = metadata.get('filename', 'event.txt')
+            
+            content_chunks = [ContentChunk(type="text", text=row[fields.content_field])]
+            
+            result = SearchResult(
+                file_id=row[fields.id_field],
+                filename=filename,
+                score=similarity_score,
+                attributes=metadata,
+                content=content_chunks
+            )
+            search_results.append(result)
+        
+        # Sort results by score (descending)
+        search_results.sort(key=lambda x: x.score, reverse=True)
+        
+        return VectorStoreSearchResponse(
+            search_query=query_text,
+            data=search_results,
+            has_more=False,
+            next_page=None
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Event scoring failed: {str(e)}")
+
+
+@app.get("/v1/events/{event_id}/similar", response_model=SimilarEventsResponse)
+async def get_similar_events(
+    event_id: str,
+    limit: Optional[int] = 20,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Get similar events for a given event ID.
+    Utilizes tags from the organizer panel to find related events.
+    Falls back to showing other available events if insufficient data.
+    """
+    try:
+        fields = settings.db_fields
+        table_name = settings.table_names["embeddings"]
+        limit = min(limit or 20, 100)
+        
+        # First, get the event's metadata to extract tags
+        event_result = await db.query_raw(
+            f"SELECT {fields.metadata_field}, {fields.content_field} FROM {table_name} WHERE {fields.id_field} = $1",
+            event_id
+        )
+        
+        if not event_result:
+            raise HTTPException(status_code=404, detail="Event not found")
+        
+        event_metadata = event_result[0][fields.metadata_field] or {}
+        event_content = event_result[0][fields.content_field]
+        tags = event_metadata.get('tags', [])
+        
+        # Generate embedding from event content and tags
+        query_text = event_content
+        if tags:
+            query_text += " " + " ".join(tags)
+        
+        query_embedding = await generate_query_embedding(query_text)
+        query_vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
+        
+        # Search for similar events using vector similarity
+        param_count = 1
+        query_params = [query_vector_str, event_id]
+        
+        base_query = f"""
+        SELECT 
+            {fields.id_field},
+            {fields.content_field},
+            {fields.metadata_field},
+            ({fields.embedding_field} <=> ${param_count}::vector) as distance
+        FROM {table_name}
+        WHERE {fields.id_field} != ${param_count + 1}
+        """
+        param_count += 2
+        
+        # If tags exist, try to boost results with matching tags
+        if tags:
+            tag_conditions = []
+            for tag in tags:
+                tag_conditions.append(f"{fields.metadata_field}->>'tag' = ${param_count}")
+                query_params.append(tag)
+                param_count += 1
+            
+            if tag_conditions:
+                # Use a subquery to first find tag-matching events, then union with vector results
+                tag_filter = "(" + " OR ".join(tag_conditions) + ")"
+                base_query += f" AND {tag_filter}"
+        
+        final_query = base_query + f" ORDER BY distance ASC LIMIT {limit}"
+        
+        results = await db.query_raw(final_query, *query_params)
+        
+        # Fallback: if too few results, show any available events
+        if len(results) < 3:
+            fallback_query = f"""
+            SELECT 
+                {fields.id_field},
+                {fields.content_field},
+                {fields.metadata_field},
+                RANDOM() as distance
+            FROM {table_name}
+            WHERE {fields.id_field} != $1
+            LIMIT {limit}
+            """
+            results = await db.query_raw(fallback_query, event_id)
+        
+        # Convert to SearchResult objects
+        search_results = []
+        for row in results:
+            similarity_score = max(0, 1 - (row['distance'] / 2)) if isinstance(row['distance'], float) else 0.5
+            metadata = row[fields.metadata_field] or {}
+            filename = metadata.get('filename', 'event.txt')
+            
+            content_chunks = [ContentChunk(type="text", text=row[fields.content_field])]
+            
+            result = SearchResult(
+                file_id=row[fields.id_field],
+                filename=filename,
+                score=similarity_score,
+                attributes=metadata,
+                content=content_chunks
+            )
+            search_results.append(result)
+        
+        search_results.sort(key=lambda x: x.score, reverse=True)
+        
+        return SimilarEventsResponse(
+            query_event_id=event_id,
+            data=search_results,
+            has_more=len(search_results) == limit
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to get similar events: {str(e)}")
 
 
 if __name__ == "__main__":

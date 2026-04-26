@@ -1,5 +1,44 @@
+```python
+# Compiled Python files
+*.pyc
+__pycache__/
+
+# Dependencies
+.venv/
+venv/
+env/
+pip-log.txt
+pip-selfcheck.json
+
+# Logs
+*.log
+
+# Environment variables
 .env
-__pycache__/*
-venv/*
-venv
-.idea
+.env.local
+*.env
+
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
+
+# IDE specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+```
