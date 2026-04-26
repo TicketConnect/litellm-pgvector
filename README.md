@@ -2,6 +2,149 @@
 
 A FastAPI application that provides OpenAI-compatible vector store endpoints using PGVector and LiteLLM proxy for embeddings.
 
+---
+
+## TicketConnect Recommendation Pipeline
+
+This service is the embedding layer **and the search index** for TicketConnect's "similar events" feature. The full data flow:
+
+```
+                                                       ┌──────────┐
+                                                       │ LiteLLM  │
+                                                       │  proxy   │
+                                                       └────▲─────┘
+                                                            │
+┌──────────────┐  create event   ┌─────────────┐   /embed   │
+│  Organizer   │ ─ name + tags ─►│   Backend   │────────────┘
+│   (panel)    │   description   │  (Elysia)   │
+└──────────────┘                 └──┬─────┬────┘
+                                    │     │  /v1/vector_stores/{id}/upsert
+                          Mongo:    │     │   id=eventId, embedding, content
+                Event.embedding ◄───┘     ▼
+                                       ┌────────────────┐
+                                       │ litellm-       │
+                                       │ pgvector       │
+                                       │ (this service) │
+                                       └─────▲────┬─────┘
+                                             │    │
+                                             │    │  hits = [{id, score}]
+              user opens event detail        │    ▼
+              GET /similar/:eventId          │  ┌──────────────────┐
+                              ▼              │  │  Backend phase 2: │
+                  ┌──────────────────────┐   │  │  Mongo find()     │
+                  │ source event's       │   │  │  filter by current│
+                  │ embedding (Mongo)    │───┘  │  state, return    │
+                  └──────────────────────┘      │  full event docs  │
+                  POST /search-by-vector        └────────┬──────────┘
+                                                         ▼
+                                                ┌────────────────┐
+                                                │  App           │
+                                                │  SimilarEvents │
+                                                │  scroller      │
+                                                └────────────────┘
+```
+
+### How a "similar event" gets ranked (end to end)
+
+1. **Organizer creates the event** in `ticketconnect-panel` with tags (curated list: rock, festival, outdoor, family-friendly, …) plus a free-text description.
+
+2. **Backend persists to Mongo** and fires a non-blocking `RecommendationService.generateEventEmbedding(eventId)`.
+
+3. **`buildEventText(event)`** assembles the embedding input. Tags are deliberately **repeated 4×** so the organizer's curated signal isn't drowned by long descriptions:
+   ```
+   "{name} {category} {tags*4} {description} {venue} {city}"
+   ```
+
+4. **Backend calls `POST /embed`** on this service:
+   ```json
+   POST http://litellm-pgvector:8000/embed
+   { "text": "Sunset Boat Party house electronic ..." }
+   → { "embedding": [0.012, -0.034, ...], "dimensions": 1536 }
+   ```
+   Internally LiteLLM routes to the configured embedding model (default `text-embedding-ada-002`, 1536 dims).
+
+5. **Backend writes the vector to two stores:**
+   - `Event.embedding` in Mongo (`select: false` — heavy field, never returned in normal queries). Used as the cache for the source-event vector and for taste-profile math.
+   - `litellm-pgvector` via `POST /v1/vector_stores/{events_id}/upsert` with `id=eventId`. This is the search index — pgvector's HNSW-style ANN runs the actual nearest-neighbor query.
+
+   The pgvector mirror is **best-effort**: a failure logs but doesn't roll back the Mongo write. Worst case, the event is briefly absent from similar-events search until the next regeneration or a backfill.
+
+6. **User likes events.** Backend writes to `User.likedEvents` + `User.likedEventsWithTime` and fires `recalculateUserTaste(walletAddress)`. That fetches the liked-event embeddings (from Mongo, where they're cached) and computes a **weighted average with a 30-day half-life** — recent likes dominate, old likes fade. Result: `User.tasteEmbedding`.
+
+7. **User opens event detail.** The app calls `GET /api/recommendations/similar/:eventId`. Backend runs a **two-phase query**:
+
+   - **Phase 1 — pgvector ranking.** Backend reads the source event's embedding from Mongo (cheap), then `POST /v1/vector_stores/{events_id}/search-by-vector` returns the top N nearest neighbors by cosine distance. Over-fetches `limit × 4` so we have headroom for filtering. Filters by **threshold ≥ 0.75** (calibrated for 1536-d OpenAI embeddings — anything lower is essentially noise; unrelated events typically score 0.65–0.72).
+   - **Phase 2 — Mongo state filter.** Backend looks up those candidate `eventId`s in Mongo with `isPublished: true`, `eventDate ≥ now`. Drops any candidate that's been deleted, unpublished, or moved to a past date. Preserves pgvector's similarity ordering and returns the top `limit` survivors.
+
+   **Why two phases?** pgvector knows vectors but not application state (publish status, date moves). Mongo knows state but doesn't have an index for vector similarity. Splitting the work means each store does what it's best at, with no metadata sync between them.
+
+   **Fallback:** if pgvector is unavailable, backend falls back to the legacy Mongo+JS scan so the feature degrades to "slower but works" instead of "broken."
+
+8. **App renders** the horizontal `SimilarEvents` scroller (`app/components/EventDetail/SimilarEvents.tsx`). Clicks are logged to `/api/recommendations/click` for analytics.
+
+### Service boundaries
+
+| Concern | Owner | Notes |
+|---------|-------|-------|
+| Embedding model selection | LiteLLM proxy config | Swap models without backend changes |
+| Text → vector | `litellm-pgvector` `/embed` | Stateless, pure transform |
+| Vector storage (cache) | MongoDB `Event.embedding`, `User.tasteEmbedding` | Source of truth for taste-profile math |
+| Vector storage (index) | `litellm-pgvector` `embeddings` table | Search index keyed by `eventId` |
+| Similarity ranking | `litellm-pgvector` `/search-by-vector` | Cosine distance via pgvector index |
+| State filtering (published, future) | MongoDB | `eventDate`, `isPublished`, `status` live here |
+
+### TicketConnect-specific endpoints
+
+These extend the OpenAI-compatible API for our use case:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /embed` | Pure text→vector. No store side effects. |
+| `POST /v1/vector_stores/{store}/upsert` | Idempotent insert/update keyed by application id (`eventId`). Replaces the `gen_random_uuid()` PK. |
+| `POST /v1/vector_stores/{store}/search-by-vector` | Search by precomputed embedding (no LLM call). Supports `exclude_ids` and metadata `filters`. |
+| `DELETE /v1/vector_stores/{store}/embeddings/{id}` | Idempotent delete. Called on event deletion. |
+| `GET /v1/vector_stores/by-name/{name}` | Look up store by name; lets backend self-bootstrap (find-or-create). |
+
+### Bootstrap
+
+The events vector store is created automatically on first need. The backend looks up `name=ticketconnect-events` via `GET /v1/vector_stores/by-name/...`; on 404 it `POST /v1/vector_stores` to create it, then caches the id for the rest of the process lifetime. No manual setup required.
+
+If you need to reset the index (e.g. after a model swap that changed embedding dimensions), drop the embeddings table or delete the store — the backend will recreate it on the next embedding call.
+
+### Operational notes
+
+- **First-time deploy:** if your Mongo already has events with embeddings (e.g. you added pgvector mirroring after the fact), run the one-shot mirror to populate pgvector without re-paying for embedding generation:
+  ```bash
+  curl -X POST 'http://backend/api/recommendations/backfill?mode=pgvector-only'
+  ```
+
+- **Full backfill** (regenerate embeddings + mirror to pgvector) — use after first deploy of the embedding pipeline, or after touching `buildEventText`:
+  ```bash
+  curl -X POST 'http://backend/api/recommendations/backfill'
+  ```
+
+- **Embedding service health:** `GET /api/recommendations/health` on the backend pings `POST /embed` end-to-end.
+
+- **Threshold tuning:** edit the `getSimilarEvents` default in `Backend/src/services/recommendationService.ts`. Start at 0.75; raise if results feel loose, lower if the section is too often empty.
+
+- **Configuration:** the backend reads two env vars:
+  - `EMBEDDING_SERVICE_URL` (default `http://localhost:8000`)
+  - `EMBEDDING_SERVICE_API_KEY` (default `sk-1234`) — must match `SERVER_API_KEY` on this service.
+
+### Drift detection (optional)
+
+Mongo and pgvector can drift if a pgvector write fails silently. Two cheap mitigations:
+
+1. **Self-healing on read:** the search-by-vector path tolerates pgvector returning ids that don't exist in Mongo (deleted events) — they're filtered out in phase 2.
+2. **Periodic reconciler:** a nightly job that compares `count(events with embedding in Mongo)` vs `count(rows in pgvector for the events store)` and triggers `?mode=pgvector-only` backfill if they diverge by more than a small margin.
+
+The reconciler isn't shipped — wire one up via cron when you've grown enough to care about consistency at the margin.
+
+---
+
+## Generic API Reference (below)
+
+
 ## Features
 
 - 🔌 OpenAI-compatible API endpoints

@@ -1,11 +1,12 @@
 import os
 import asyncio
 import time
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from prisma import Prisma
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from models import (
@@ -801,6 +802,296 @@ async def create_embeddings_batch(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to create embeddings batch: {str(e)}")
+
+
+class EmbedRequest(BaseModel):
+    text: str
+
+
+class EmbedResponse(BaseModel):
+    embedding: List[float]
+    dimensions: int
+
+
+@app.post("/embed", response_model=EmbedResponse)
+async def embed_text(request: EmbedRequest):
+    """
+    Generate an embedding for arbitrary text.
+
+    Used by the TicketConnect backend to embed event descriptions/tags
+    and user taste profiles. No vector store side effects — pure transform.
+    """
+    if not request.text or not request.text.strip():
+        raise HTTPException(status_code=400, detail="text must be a non-empty string")
+
+    try:
+        vector = await embedding_service.generate_embedding(request.text)
+        return EmbedResponse(embedding=vector, dimensions=len(vector))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to generate embedding: {str(e)}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TicketConnect-specific endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+# These extend the OpenAI-compatible API with operations the TicketConnect
+# backend needs: idempotent upserts keyed by application ID (eventId), search
+# by precomputed vector (skips redundant embedding generation), and a get-
+# or-create lookup for self-bootstrapping the events vector store.
+
+class UpsertEmbeddingRequest(BaseModel):
+    id: str  # Application-supplied ID (e.g. eventId) — used as the row PK
+    content: str
+    embedding: List[float]
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class SearchByVectorRequest(BaseModel):
+    embedding: List[float]
+    limit: Optional[int] = 20
+    filters: Optional[Dict[str, Any]] = None
+    exclude_ids: Optional[List[str]] = None
+    return_metadata: Optional[bool] = True
+
+
+class VectorSearchResultItem(BaseModel):
+    id: str
+    score: float
+    content: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class SearchByVectorResponse(BaseModel):
+    object: str = "vector_store.search_by_vector"
+    data: List[VectorSearchResultItem]
+
+
+@app.post("/v1/vector_stores/{vector_store_id}/upsert", response_model=EmbeddingResponse)
+async def upsert_embedding(
+    vector_store_id: str,
+    request: UpsertEmbeddingRequest,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Idempotent upsert keyed by `id`. INSERT on first call, UPDATE on subsequent
+    calls. Use this when the caller owns a stable identity (e.g. eventId) and
+    wants writes to be safely retryable.
+
+    Replaces gen_random_uuid() PK with the caller-supplied id.
+    """
+    from typing import Dict as _Dict, Any as _Any
+
+    # Verify vector store exists
+    vector_store_table = settings.table_names["vector_stores"]
+    vector_store_result = await db.query_raw(
+        f"SELECT id FROM {vector_store_table} WHERE id = $1",
+        vector_store_id
+    )
+    if not vector_store_result:
+        raise HTTPException(status_code=404, detail="Vector store not found")
+
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+    embedding_vector_str = "[" + ",".join(map(str, request.embedding)) + "]"
+
+    try:
+        result = await db.query_raw(
+            f"""
+            INSERT INTO {table_name}
+                ({fields.id_field}, {fields.vector_store_id_field}, {fields.content_field},
+                 {fields.embedding_field}, {fields.metadata_field}, {fields.created_at_field})
+            VALUES ($1, $2, $3, $4::vector, $5, NOW())
+            ON CONFLICT ({fields.id_field}) DO UPDATE SET
+                {fields.content_field}   = EXCLUDED.{fields.content_field},
+                {fields.embedding_field} = EXCLUDED.{fields.embedding_field},
+                {fields.metadata_field}  = EXCLUDED.{fields.metadata_field}
+            RETURNING {fields.id_field}, {fields.vector_store_id_field}, {fields.content_field},
+                     {fields.metadata_field},
+                     EXTRACT(EPOCH FROM {fields.created_at_field})::bigint as created_at_timestamp
+            """,
+            request.id,
+            vector_store_id,
+            request.content,
+            embedding_vector_str,
+            request.metadata or {}
+        )
+
+        if not result:
+            raise HTTPException(status_code=500, detail="Failed to upsert embedding")
+
+        row = result[0]
+        return EmbeddingResponse(
+            id=row[fields.id_field],
+            vector_store_id=row[fields.vector_store_id_field],
+            content=row[fields.content_field],
+            metadata=row[fields.metadata_field],
+            created_at=int(row["created_at_timestamp"])
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to upsert embedding: {str(e)}")
+
+
+@app.post("/v1/vector_stores/{vector_store_id}/search-by-vector", response_model=SearchByVectorResponse)
+async def search_by_vector(
+    vector_store_id: str,
+    request: SearchByVectorRequest,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Search by a precomputed embedding vector (no LLM call).
+
+    Used by the TicketConnect "similar events" feature where the source event's
+    embedding is already cached on the Event document — regenerating it via
+    /search would waste an embedding-model call and add latency.
+
+    Returns ids + scores; the caller is expected to fetch the full domain
+    objects from its primary store (Mongo) for display.
+    """
+    # Verify vector store exists
+    vector_store_table = settings.table_names["vector_stores"]
+    vector_store_result = await db.query_raw(
+        f"SELECT id FROM {vector_store_table} WHERE id = $1",
+        vector_store_id
+    )
+    if not vector_store_result:
+        raise HTTPException(status_code=404, detail="Vector store not found")
+
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+    limit = min(request.limit or 20, 200)
+    query_vector_str = "[" + ",".join(map(str, request.embedding)) + "]"
+
+    param_count = 1
+    query_params: List[Any] = [query_vector_str, vector_store_id]
+    base_query = f"""
+        SELECT
+            {fields.id_field},
+            {fields.content_field},
+            {fields.metadata_field},
+            ({fields.embedding_field} <=> ${param_count}::vector) as distance
+        FROM {table_name}
+        WHERE {fields.vector_store_id_field} = ${param_count + 1}
+    """
+    param_count += 2
+
+    if request.exclude_ids:
+        placeholders = ",".join(
+            f"${i}" for i in range(param_count, param_count + len(request.exclude_ids))
+        )
+        base_query += f" AND {fields.id_field} NOT IN ({placeholders})"
+        query_params.extend(request.exclude_ids)
+        param_count += len(request.exclude_ids)
+
+    if request.filters:
+        for key, value in request.filters.items():
+            base_query += (
+                f" AND {fields.metadata_field}->>${param_count} = ${param_count + 1}"
+            )
+            query_params.extend([key, str(value)])
+            param_count += 2
+
+    final_query = base_query + f" ORDER BY distance ASC LIMIT {limit}"
+
+    try:
+        rows = await db.query_raw(final_query, *query_params)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+    items: List[VectorSearchResultItem] = []
+    for row in rows:
+        # Cosine distance ranges 0 (identical) .. 2 (opposite). Convert to
+        # similarity in [0, 1] using the same formula as the existing /search.
+        similarity = max(0.0, 1.0 - (row["distance"] / 2.0))
+        items.append(VectorSearchResultItem(
+            id=row[fields.id_field],
+            score=similarity,
+            content=row[fields.content_field],
+            metadata=row[fields.metadata_field] if request.return_metadata else None,
+        ))
+
+    return SearchByVectorResponse(data=items)
+
+
+@app.delete("/v1/vector_stores/{vector_store_id}/embeddings/{embedding_id}")
+async def delete_embedding(
+    vector_store_id: str,
+    embedding_id: str,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Delete an embedding by id. Idempotent — returns success even if the row
+    doesn't exist (caller doesn't need to track which IDs were ever inserted).
+    """
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+
+    try:
+        await db.execute_raw(
+            f"""
+            DELETE FROM {table_name}
+            WHERE {fields.id_field} = $1 AND {fields.vector_store_id_field} = $2
+            """,
+            embedding_id,
+            vector_store_id
+        )
+        return {"deleted": True, "id": embedding_id}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to delete embedding: {str(e)}")
+
+
+@app.get("/v1/vector_stores/by-name/{name}", response_model=VectorStoreResponse)
+async def get_vector_store_by_name(
+    name: str,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Look up a vector store by name. Returns the most recently created match,
+    or 404 if none exist. Lets clients self-bootstrap (find-or-create) without
+    needing to remember a hardcoded UUID across restarts.
+    """
+    vector_store_table = settings.table_names["vector_stores"]
+    rows = await db.query_raw(
+        f"""
+        SELECT id, name, file_counts, status, usage_bytes, expires_after, expires_at,
+               last_active_at, metadata,
+               EXTRACT(EPOCH FROM created_at)::bigint as created_at_timestamp
+        FROM {vector_store_table}
+        WHERE name = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        name
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Vector store not found")
+
+    row = rows[0]
+    expires_at = int(row["expires_at"].timestamp()) if row.get("expires_at") else None
+    last_active_at = int(row["last_active_at"].timestamp()) if row.get("last_active_at") else None
+
+    return VectorStoreResponse(
+        id=row["id"],
+        created_at=int(row["created_at_timestamp"]),
+        name=row["name"],
+        usage_bytes=row["usage_bytes"] or 0,
+        file_counts=row["file_counts"] or {"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0},
+        status=row["status"],
+        expires_after=row["expires_after"],
+        expires_at=expires_at,
+        last_active_at=last_active_at,
+        metadata=row["metadata"]
+    )
 
 
 @app.get("/health")
