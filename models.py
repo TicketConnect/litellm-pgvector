@@ -109,3 +109,17 @@ class UserPreferenceResponse(BaseModel):
     preference_key: str
     preference_value: Any
     updated_at: int
+
+
+# Models for event scoring and recommendations
+class EventScoreRequest(BaseModel):
+    event_id: str
+    tags: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class SimilarEventsResponse(BaseModel):
+    object: str = "event.similar.list"
+    query_event_id: str
+    data: List[SearchResult]
+    has_more: bool = False
