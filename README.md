@@ -1,4 +1,4 @@
-# OpenAI Vector Stores API with PGVector
+# TicketConnect Algo
 
 A FastAPI application that provides OpenAI-compatible vector store endpoints using PGVector and LiteLLM proxy for embeddings.
 
