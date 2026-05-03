@@ -123,3 +123,20 @@ class SimilarEventsResponse(BaseModel):
     query_event_id: str
     data: List[SearchResult]
     has_more: bool = False
+
+
+class FeedRecommendationRequest(BaseModel):
+    taste_embedding: List[float]
+    limit: Optional[int] = 20
+    exclude_ids: Optional[List[str]] = None
+    user_id: Optional[str] = None  # wallet address — used to fetch ratings for score boosting
+
+
+class FeedRecommendationItem(BaseModel):
+    id: str    # eventId
+    score: float
+
+
+class FeedRecommendationResponse(BaseModel):
+    object: str = "feed.recommendations"
+    data: List[FeedRecommendationItem]

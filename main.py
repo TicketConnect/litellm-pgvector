@@ -26,7 +26,10 @@ from models import (
     UserPreferenceCreateRequest,
     UserPreferenceResponse,
     SimilarEventsResponse,
-    EventScoreRequest
+    EventScoreRequest,
+    FeedRecommendationRequest,
+    FeedRecommendationItem,
+    FeedRecommendationResponse,
 )
 from config import settings
 from embedding_service import embedding_service
@@ -1098,6 +1101,115 @@ async def get_vector_store_by_name(
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": int(time.time())}
+
+
+@app.post("/v1/feed/recommendations", response_model=FeedRecommendationResponse)
+async def feed_recommendations(
+    request: FeedRecommendationRequest,
+    api_key: str = Depends(get_api_key),
+):
+    """
+    Personalized feed recommendations using a precomputed user taste embedding.
+
+    The caller (TicketConnect backend) passes the user's tasteEmbedding — a
+    weighted average of the embeddings of events they have liked, with a 30-day
+    half-life so recent activity dominates.
+
+    Unlike /search-by-vector (which is keyed on a source *event*), this endpoint
+    is keyed on a *user* taste vector and optionally boosts scores using the
+    user's per-event ratings stored in user_rating.
+
+    Returns a ranked list of { id (eventId), score } items. The caller is
+    responsible for the second phase: filtering by publish status / future date
+    in its primary store (Mongo) before returning results to the client.
+    """
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+    vector_store_table = settings.table_names["vector_stores"]
+    limit = min(request.limit or 20, 200)
+
+    query_vector_str = "[" + ",".join(map(str, request.taste_embedding)) + "]"
+
+    # ── Phase 1: resolve the events vector store ──────────────────────────────
+    # We search across *all* vector stores that hold event embeddings. In
+    # practice there is exactly one (ticketconnect-events), but we look it up
+    # dynamically so this doesn't hardcode an ID.
+    store_rows = await db.query_raw(
+        f"SELECT id FROM {vector_store_table} WHERE name = $1 LIMIT 1",
+        "ticketconnect-events",
+    )
+    if not store_rows:
+        raise HTTPException(status_code=404, detail="events vector store not found")
+
+    vector_store_id = store_rows[0]["id"]
+
+    # ── Phase 2: ANN search by cosine distance ────────────────────────────────
+    param_count = 1
+    query_params: List[Any] = [query_vector_str, vector_store_id]
+    base_query = f"""
+        SELECT
+            {fields.id_field},
+            ({fields.embedding_field} <=> ${param_count}::vector) AS distance
+        FROM {table_name}
+        WHERE {fields.vector_store_id_field} = ${param_count + 1}
+    """
+    param_count += 2
+
+    if request.exclude_ids:
+        placeholders = ",".join(
+            f"${i}" for i in range(param_count, param_count + len(request.exclude_ids))
+        )
+        base_query += f" AND {fields.id_field} NOT IN ({placeholders})"
+        query_params.extend(request.exclude_ids)
+        param_count += len(request.exclude_ids)
+
+    # Over-fetch so ratings boosting can reorder without falling below `limit`
+    final_query = base_query + f" ORDER BY distance ASC LIMIT {limit * 4}"
+
+    try:
+        rows = await db.query_raw(final_query, *query_params)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Feed recommendation search failed: {str(e)}")
+
+    # ── Phase 3: optional ratings boost ──────────────────────────────────────
+    user_ratings: dict = {}
+    if request.user_id and rows:
+        try:
+            embedding_ids = [row[fields.id_field] for row in rows]
+            placeholders = ",".join(f"${i}" for i in range(2, 2 + len(embedding_ids)))
+            ratings_rows = await db.query_raw(
+                f"""
+                SELECT embedding_id, rating
+                FROM user_rating
+                WHERE user_id = $1 AND embedding_id IN ({placeholders})
+                """,
+                request.user_id,
+                *embedding_ids,
+            )
+            for r in ratings_rows:
+                user_ratings[r["embedding_id"]] = r["rating"]
+        except Exception:
+            pass  # ratings boost is best-effort; never fail the request
+
+    # ── Phase 4: score, boost, sort, truncate ─────────────────────────────────
+    items: List[FeedRecommendationItem] = []
+    for row in rows:
+        # Cosine distance [0, 2] → similarity [0, 1]
+        similarity = max(0.0, 1.0 - (row["distance"] / 2.0))
+
+        event_id = row[fields.id_field]
+        if event_id in user_ratings:
+            # Scale: rating 1-5, neutral at 3. Each point → ±10% adjustment.
+            boost = (user_ratings[event_id] - 3) * 0.1
+            similarity = max(0.0, min(1.0, similarity * (1 + boost)))
+
+        items.append(FeedRecommendationItem(id=event_id, score=similarity))
+
+    items.sort(key=lambda x: x.score, reverse=True)
+
+    return FeedRecommendationResponse(data=items[:limit])
 
 
 @app.post("/v1/events/score", response_model=VectorStoreSearchResponse)

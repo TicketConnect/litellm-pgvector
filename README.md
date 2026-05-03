@@ -57,7 +57,7 @@ This service is the embedding layer **and the search index** for TicketConnect's
 
 4. **Backend calls `POST /embed`** on this service:
    ```json
-   POST http://litellm-pgvector:8000/embed
+   POST http://algo:8000/embed
    { "text": "Sunset Boat Party house electronic ..." }
    → { "embedding": [0.012, -0.034, ...], "dimensions": 1536 }
    ```
