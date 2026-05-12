@@ -22,8 +22,7 @@ model VectorStore {
   last_active_at DateTime?
   metadata     Json?
   embeddings   Embedding[]
-  ratings      UserRating[]
-  
+
   @@map("vector_stores")
 }
 
